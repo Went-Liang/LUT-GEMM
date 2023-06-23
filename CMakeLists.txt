@@ -10,7 +10,7 @@ include_directories(${EIGEN3_INCLUDE_DIRS})
 
 add_executable(lut_gemm main.cu)
 
-target_link_libraries(lut_gemm OpenMP::OpenMP_CXX)
+target_link_libraries(lut_gemm OpenMP::OpenMP_CXX ${CUDA_cublas_LIBRARY})
 
 set_target_properties(lut_gemm PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON)
