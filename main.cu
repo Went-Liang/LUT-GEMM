@@ -110,7 +110,7 @@ public:
 };
 
 template<typename T, typename STYPE, typename BTYPE, int group_size, int q>
-__global__ void lut_gemm_kernel(const unsigned m, const unsigned n, const unsigned k,
+__global__ void lut_gemm_kernel_v0(const unsigned m, const unsigned n, const unsigned k,
                                 const unsigned A_col_num, const unsigned B_col_num,
                                 const STYPE *__restrict__ A, const BTYPE *__restrict__ B, const T *__restrict__ X,
                                 T *__restrict__ Y) {
@@ -149,6 +149,102 @@ __global__ void lut_gemm_kernel(const unsigned m, const unsigned n, const unsign
     }
 }
 
+template<typename T, typename STYPE, typename BTYPE, int group_size, int q>
+__global__ void lut_gemm_kernel_v1(const unsigned m, const unsigned n, const unsigned k,
+                                const unsigned A_col_num, const unsigned B_col_num,
+                                const STYPE *__restrict__ A, const BTYPE *__restrict__ B, const T *__restrict__ X,
+                                T *__restrict__ Y) {
+    constexpr unsigned int subgroup_size = sizeof(BTYPE) * 8;
+    constexpr unsigned int lut_num = group_size / subgroup_size;
+    const unsigned int lut_size = pow(2, subgroup_size);
+    unsigned int group_id = blockIdx.y;
+    unsigned int th_id = threadIdx.x;
+    unsigned int row_id = threadIdx.x + blockDim.x * blockIdx.x;
+    extern __shared__ T shared_mem[];
+    T* groupx = shared_mem;
+    T* luts = shared_mem + group_size;
+    T bins[subgroup_size];
+#pragma unroll
+    for (int j = 0; j < subgroup_size; ++j) {
+        bins[j] = ((th_id % lut_size >> j) & 1) ? 1 : -1;
+    }
+    unsigned int iteration = lut_size * lut_num / blockDim.x;
+
+    for(int ik = 0; ik < k; ++ik) {
+        if (th_id < group_size)groupx[th_id] = X[(group_id * group_size + th_id) * k + ik];
+        __syncthreads();
+#pragma unroll
+        for(int iter = 0; iter < iteration; iter++){
+            T sum = 0;
+#pragma unroll
+            for (int j = 0; j < subgroup_size; ++j) {
+                sum += groupx[iter * subgroup_size * iteration + (th_id / lut_size) * subgroup_size + j] * bins[j];
+            }
+            luts[iter * lut_size * iteration + (th_id / lut_size) * lut_size + th_id % lut_size] = sum;
+        }
+        __syncthreads();
+
+        for (int iq = 0; iq < q; ++iq) {
+            T sum = 0;
+#pragma unroll
+            for (int i = 0; i < lut_num; ++i) {
+                BTYPE decimal_b = B[row_id * B_col_num * q + (group_id * lut_num + i) * q + iq];
+                sum += luts[i * lut_size + decimal_b];
+            }
+            sum *= A[row_id * A_col_num * q + group_id * q + iq];
+            atomicAdd(&Y[row_id * k + ik], sum);
+        }
+    }
+}
+// 把AB调整为q * n * m, 这样内存访问就能合并
+template<typename T, typename STYPE, typename BTYPE, int group_size, int q>
+__global__ void lut_gemm_kernel_v2(const unsigned m, const unsigned n, const unsigned k,
+                                   const unsigned A_col_num, const unsigned B_col_num,
+                                   const STYPE *__restrict__ A, const BTYPE *__restrict__ B, const T *__restrict__ X,
+                                   T *__restrict__ Y) {
+    constexpr unsigned int subgroup_size = sizeof(BTYPE) * 8;
+    constexpr unsigned int lut_num = group_size / subgroup_size;
+    const unsigned int lut_size = pow(2, subgroup_size);
+    unsigned int group_id = blockIdx.y;
+    unsigned int th_id = threadIdx.x;
+    unsigned int row_id = threadIdx.x + blockDim.x * blockIdx.x;
+    extern __shared__ T shared_mem[];
+    T* groupx = shared_mem;
+    T* luts = shared_mem + group_size;
+    T bins[subgroup_size];
+#pragma unroll
+    for (int j = 0; j < subgroup_size; ++j) {
+        bins[j] = ((th_id % lut_size >> j) & 1) ? 1 : -1;
+    }
+    unsigned int iteration = lut_size * lut_num / blockDim.x;
+
+    for(int ik = 0; ik < k; ++ik) {
+        if (th_id < group_size)groupx[th_id] = X[(group_id * group_size + th_id) * k + ik];
+        __syncthreads();
+#pragma unroll
+        for(int iter = 0; iter < iteration; iter++){
+            T sum = 0;
+#pragma unroll
+            for (int j = 0; j < subgroup_size; ++j) {
+                sum += groupx[iter * subgroup_size * iteration + (th_id / lut_size) * subgroup_size + j] * bins[j];
+            }
+            luts[iter * lut_size * iteration + (th_id / lut_size) * lut_size + th_id % lut_size] = sum;
+        }
+        __syncthreads();
+
+        for (int iq = 0; iq < q; ++iq) {
+            T sum = 0;
+#pragma unroll
+            for (int i = 0; i < lut_num; ++i) {
+                BTYPE decimal_b = B[iq * m * B_col_num + (group_id * lut_num + i) * m + row_id];
+                sum += luts[i * lut_size + decimal_b];
+            }
+            sum *= A[iq * m * A_col_num + group_id * m + row_id];
+            atomicAdd(&Y[row_id * k + ik], sum);
+        }
+    }
+}
+
 int main() {
     int gpu_rank = 0;
     cudaDeviceProp deviceProp{};
@@ -170,9 +266,10 @@ int main() {
     typedef float STYPE;                // scaleMat  A
     typedef std::uint8_t BTYPE;         // binaryMat B
     int subgroup_size = sizeof(BTYPE) * 8;
+    int th = 1024;
     const int q = 3;
     const int g = 128;
-    unsigned m = 2048;
+    unsigned m = 8192;
     unsigned n = 1024;
     unsigned k = 1;
     unsigned A_col_num = (int) ceil((float) n / (float) g);
@@ -208,11 +305,10 @@ int main() {
     cuTimer timer{};
 
     {
-        int th = 1024;
         dim3 block(th);
         dim3 grid((m - 1) / block.x + 1, (n - 1) / g + 1);
         cudaMemset(deviceYPtr, 0, (m * k) * sizeof(T));
-        lut_gemm_kernel<T, STYPE, BTYPE, g, q>
+        lut_gemm_kernel_v0<T, STYPE, BTYPE, g, q>
         <<<grid, block, pow(2, subgroup_size) * (g / subgroup_size) * sizeof(T)>>>
                 (m, n, k,
                  A_col_num, B_col_num,
@@ -221,13 +317,86 @@ int main() {
         cudaDeviceSynchronize();
         cudaMemcpy(cuY.data(), deviceYPtr, (m * k) * sizeof(T), cudaMemcpyDeviceToHost);
         Eigen::Tensor<T, 2, Eigen::RowMajor> diffArray = (cuY - Y).abs();
-        std::cout << "lut-gemm Max Error: " << diffArray.maximum() << " ";
+        std::cout << "lut-gemm-v0 Max Error: " << diffArray.maximum() << " ";
 
         double elapsedTime = 0;
         for (int i = 0; i < iteration; ++i) {
             cudaMemset(deviceYPtr, 0, (m * k) * sizeof(T));
             timer.start();
-            lut_gemm_kernel<T, STYPE, BTYPE, g, q>
+            lut_gemm_kernel_v0<T, STYPE, BTYPE, g, q>
+            <<<grid, block, pow(2, subgroup_size) * (g / subgroup_size) * sizeof(T)>>>
+                    (m, n, k,
+                     A_col_num, B_col_num,
+                     deviceAPtr, deviceBPtr, deviceXPtr, deviceYPtr);
+            elapsedTime += timer.end();
+        }
+        elapsedTime /= iteration;
+        printf("Average Time: %.3f ms\n", elapsedTime);
+    }
+
+    {
+        dim3 block(th);
+        dim3 grid((m - 1) / block.x + 1, (n - 1) / g + 1);
+        cudaMemset(deviceYPtr, 0, (m * k) * sizeof(T));
+        lut_gemm_kernel_v1<T, STYPE, BTYPE, g, q>
+        <<<grid, block, (pow(2, subgroup_size) * (g / subgroup_size) + g) * sizeof(T)>>>
+                (m, n, k,
+                 A_col_num, B_col_num,
+                 deviceAPtr, deviceBPtr, deviceXPtr, deviceYPtr);
+
+        cudaDeviceSynchronize();
+        cudaMemcpy(cuY.data(), deviceYPtr, (m * k) * sizeof(T), cudaMemcpyDeviceToHost);
+        Eigen::Tensor<T, 2, Eigen::RowMajor> diffArray = (cuY - Y).abs();
+        std::cout << "lut-gemm-v1 Max Error: " << diffArray.maximum() << " ";
+
+        double elapsedTime = 0;
+        for (int i = 0; i < iteration; ++i) {
+            cudaMemset(deviceYPtr, 0, (m * k) * sizeof(T));
+            timer.start();
+            lut_gemm_kernel_v1<T, STYPE, BTYPE, g, q>
+            <<<grid, block, pow(2, subgroup_size) * (g / subgroup_size) * sizeof(T)>>>
+                    (m, n, k,
+                     A_col_num, B_col_num,
+                     deviceAPtr, deviceBPtr, deviceXPtr, deviceYPtr);
+            elapsedTime += timer.end();
+        }
+        elapsedTime /= iteration;
+        printf("Average Time: %.3f ms\n", elapsedTime);
+    }
+
+    {
+        Eigen::array<Eigen::Index, 3> shuffles = {2, 1, 0};
+        Eigen::Tensor<STYPE, 3, Eigen::RowMajor> qnmA = A.shuffle(shuffles);
+        Eigen::Tensor<BTYPE, 3, Eigen::RowMajor> qnmB = B.shuffle(shuffles);
+
+        STYPE *deviceAPtr_qnm;
+        BTYPE *deviceBPtr_qnm;
+        cudaMalloc(&deviceAPtr_qnm, (m * A_col_num * q) * sizeof(STYPE));
+        cudaMalloc(&deviceBPtr_qnm, (m * B_col_num * q) * sizeof(BTYPE));
+        cudaMemcpy(deviceAPtr_qnm, qnmA.data(), (m * A_col_num * q) * sizeof(STYPE),
+                   cudaMemcpyHostToDevice);
+        cudaMemcpy(deviceBPtr_qnm, qnmB.data(), (m * B_col_num * q) * sizeof(BTYPE),
+                   cudaMemcpyHostToDevice);
+
+        dim3 block(th);
+        dim3 grid((m - 1) / block.x + 1, (n - 1) / g + 1);
+        cudaMemset(deviceYPtr, 0, (m * k) * sizeof(T));
+        lut_gemm_kernel_v2<T, STYPE, BTYPE, g, q>
+        <<<grid, block, (pow(2, subgroup_size) * (g / subgroup_size)) * sizeof(T)>>>
+                (m, n, k,
+                 A_col_num, B_col_num,
+                 deviceAPtr_qnm, deviceBPtr_qnm, deviceXPtr, deviceYPtr);
+
+        cudaDeviceSynchronize();
+        cudaMemcpy(cuY.data(), deviceYPtr, (m * k) * sizeof(T), cudaMemcpyDeviceToHost);
+        Eigen::Tensor<T, 2, Eigen::RowMajor> diffArray = (cuY - Y).abs();
+        std::cout << "lut-gemm-v2 Max Error: " << diffArray.maximum() << " ";
+
+        double elapsedTime = 0;
+        for (int i = 0; i < iteration; ++i) {
+            cudaMemset(deviceYPtr, 0, (m * k) * sizeof(T));
+            timer.start();
+            lut_gemm_kernel_v2<T, STYPE, BTYPE, g, q>
             <<<grid, block, pow(2, subgroup_size) * (g / subgroup_size) * sizeof(T)>>>
                     (m, n, k,
                      A_col_num, B_col_num,
