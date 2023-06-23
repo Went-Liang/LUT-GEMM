@@ -116,7 +116,7 @@ __global__ void lut_gemm_kernel_v0(const unsigned m, const unsigned n, const uns
                                 T *__restrict__ Y) {
     constexpr unsigned int subgroup_size = sizeof(BTYPE) * 8;
     constexpr unsigned int lut_num = group_size / subgroup_size;
-    const unsigned int lut_size = pow(2, subgroup_size);
+    const unsigned int lut_size = powf(2, subgroup_size);
     unsigned int group_id = blockIdx.y;
     unsigned int row_id = threadIdx.x + blockDim.x * blockIdx.x;
     extern __shared__ T luts[];
@@ -156,7 +156,7 @@ __global__ void lut_gemm_kernel_v1(const unsigned m, const unsigned n, const uns
                                 T *__restrict__ Y) {
     constexpr unsigned int subgroup_size = sizeof(BTYPE) * 8;
     constexpr unsigned int lut_num = group_size / subgroup_size;
-    const unsigned int lut_size = pow(2, subgroup_size);
+    const unsigned int lut_size = powf(2, subgroup_size);
     unsigned int group_id = blockIdx.y;
     unsigned int th_id = threadIdx.x;
     unsigned int row_id = threadIdx.x + blockDim.x * blockIdx.x;
@@ -204,7 +204,7 @@ __global__ void lut_gemm_kernel_v2(const unsigned m, const unsigned n, const uns
                                    T *__restrict__ Y) {
     constexpr unsigned int subgroup_size = sizeof(BTYPE) * 8;
     constexpr unsigned int lut_num = group_size / subgroup_size;
-    const unsigned int lut_size = pow(2, subgroup_size);
+    const unsigned int lut_size = powf(2, subgroup_size);
     unsigned int group_id = blockIdx.y;
     unsigned int th_id = threadIdx.x;
     unsigned int row_id = threadIdx.x + blockDim.x * blockIdx.x;
@@ -258,7 +258,7 @@ int main() {
            "GFLOPS\n",
            boostFrequency, fp32CoresNum, peakPerformance);
     omp_set_num_threads(omp_get_num_procs());
-    int iteration = 10;
+    int iteration = 1;
 
 
 //    typedef Eigen::bfloat16 T;        // W X Y: before quant
